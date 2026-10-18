@@ -8,6 +8,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+# CLI compatibility: direct `python neon-uploader.py` now uses the same
+# isolated, install-if-needed launcher as `python run.py`.
+if __name__ == "__main__" and os.environ.get("NEON_BOOTSTRAPPED") != "1":
+    from run import main as launch
+    raise SystemExit(launch())
+
 from flask import Flask, abort, jsonify, render_template_string, request, send_file
 from werkzeug.utils import secure_filename
 
