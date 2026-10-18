@@ -3,6 +3,8 @@
 import datetime
 import os
 import secrets
+import threading
+import time
 import shutil
 import tempfile
 import zipfile
@@ -14,12 +16,64 @@ if __name__ == "__main__" and os.environ.get("NEON_BOOTSTRAPPED") != "1":
     from run import main as launch
     raise SystemExit(launch())
 
-from flask import Flask, abort, jsonify, render_template_string, request, send_file
+from flask import Flask, abort, jsonify, render_template_string, request, send_file, make_response
 from werkzeug.utils import secure_filename
 
 
 MAX_SELECTION = 1000
 MAX_ARCHIVE_FILES = 10000
+TICKET_SECONDS = 90
+SESSION_SECONDS = 12 * 60 * 60
+TOKEN_PATH = Path.home() / ".config" / "neon-uploader" / "access-token"
+
+
+def get_network_token():
+    """Persistent private server-side secret, stable across Pi reboots."""
+    supplied = os.environ.get("NEON_ACCESS_TOKEN", "").strip()
+    if supplied:
+        return supplied
+    path = TOKEN_PATH
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError("Refusing to read a symlink as the access-token file")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(secrets.token_urlsafe(32) + "\n")
+        print(f"[neon] Generated network access password in {path}", flush=True)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("Invalid token file")
+    if os.name != "nt" and (path.stat().st_mode & 0o077):
+        raise RuntimeError(f"Token file permissions are unsafe. Run: chmod 600 {path}")
+    value = path.read_text(encoding="ascii").strip()
+    if len(value) < 24:
+        raise RuntimeError("Access token is too short; supply a longer NEON_ACCESS_TOKEN")
+    return value
+
+
+LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="referrer" content="no-referrer"><title>Neon Uploader login</title>
+<style>body{background:#090e16;color:#eaf4ff;font:16px system-ui;padding:3rem}
+main{max-width:32rem;margin:auto}small{color:#9eb1c5}</style></head><body>
+<main><h2>Neon Uploader</h2><p id="status">Signing in...</p>
+<small>One-time sign-in from your Windows launcher.</small></main>
+<script>
+(async function(){
+  const params = new URLSearchParams(location.hash.slice(1));
+  const ticket = params.get('ticket');
+  history.replaceState(null, '', '/__neon_login');
+  if (!ticket) { document.querySelector('#status').textContent='No sign-in ticket. Launch neon-client.bat on Windows.'; return; }
+  try {
+    const response=await fetch('/__neon_login', {method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket})});
+    if(!response.ok)throw Error('Sign-in ticket expired, invalid or from another device.');
+    location.replace('/');
+  } catch (error) {document.querySelector('#status').textContent=error.message;}
+})();
+</script></body></html>"""
 
 
 def human_readable_size(size_bytes):
@@ -57,6 +111,24 @@ def create_app(upload_folder="uploads", access_token=None):
     root = Path(upload_folder).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     token = access_token if access_token is not None else os.environ.get("NEON_ACCESS_TOKEN", "")
+    lock = threading.Lock()
+    tickets = {}   # random ticket -> (expiry, originating IP)
+    sessions = {}  # random cookie -> (expiry, originating IP)
+
+    def basic_ok():
+        auth = request.authorization
+        return bool(token and auth and auth.type.lower() == "basic"
+                    and secrets.compare_digest(auth.username or "", "neon")
+                    and secrets.compare_digest(auth.password or "", token))
+
+    def session_ok():
+        cookie = request.cookies.get("neon_remote_session", "")
+        if not cookie:
+            return False
+        with lock:
+            state = sessions.get(cookie)
+            return bool(state and state[0] > time.monotonic()
+                        and state[1] == request.remote_addr)
 
     def resolve_path(relative="", kind=None):
         if not isinstance(relative, str) or relative.startswith("/") or "\\" in relative:
@@ -92,13 +164,12 @@ def create_app(upload_folder="uploads", access_token=None):
 
     @app.before_request
     def check_access():
-        if token:
-            auth = request.authorization
-            if not (auth and auth.type.lower() == "basic"
-                    and secrets.compare_digest(auth.username or "", "neon")
-                    and secrets.compare_digest(auth.password or "", token)):
-                return ("Authentication required", 401,
-                        {"WWW-Authenticate": 'Basic realm="Neon Uploader"'})
+        # The landing/exchange endpoint contains no file data and accepts only
+        # one-use, short-lived tickets issued after Basic authentication.
+        public_login = request.path == "/__neon_login" and request.method in ("GET", "POST")
+        if token and not public_login and not (basic_ok() or session_ok()):
+            return ("Authentication required", 401,
+                    {"WWW-Authenticate": 'Basic realm="Neon Uploader"'})
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
             origin = request.headers.get("Origin")
             if origin and origin.rstrip("/") != request.host_url.rstrip("/"):
@@ -109,8 +180,58 @@ def create_app(upload_folder="uploads", access_token=None):
     @app.errorhandler(404)
     @app.errorhandler(409)
     @app.errorhandler(413)
+    @app.errorhandler(429)
     def handle_error(error):
         return jsonify(error=error.description), error.code
+
+    @app.post("/api/auth/ticket")
+    def issue_browser_ticket():
+        # Never allow the cookie alone to mint a new ticket.
+        if not basic_ok():
+            abort(403, description="Password required to issue a login ticket")
+        now = time.monotonic()
+        peer = request.remote_addr
+        with lock:
+            for key, (deadline, _) in list(tickets.items()):
+                if deadline < now:
+                    tickets.pop(key, None)
+            if sum(ip == peer for _, ip in tickets.values()) >= 5:
+                abort(429, description="Too many pending login tickets")
+            ticket = secrets.token_urlsafe(32)
+            tickets[ticket] = (now + TICKET_SECONDS, peer)
+        response = jsonify(ticket=ticket, expires_in=TICKET_SECONDS)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/__neon_login", methods=["GET", "POST"])
+    def browser_login():
+        if request.method == "GET":
+            response = make_response(LOGIN_HTML)
+            response.headers["Content-Security-Policy"] = "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; style-src 'unsafe-inline'"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        data = request.get_json(silent=True) or {}
+        ticket = data.get("ticket")
+        if not isinstance(ticket, str) or not ticket:
+            abort(403, description="Invalid login ticket")
+        with lock:
+            entry = tickets.get(ticket)
+            if not entry or entry[0] < time.monotonic() or entry[1] != request.remote_addr:
+                abort(403, description="Invalid, expired or client-mismatched login ticket")
+            tickets.pop(ticket, None)  # atomic one-use redemption
+            session = secrets.token_urlsafe(32)
+            sessions[session] = (time.monotonic() + SESSION_SECONDS, request.remote_addr)
+            for key, (deadline, _) in list(sessions.items()):
+                if deadline < time.monotonic():
+                    sessions.pop(key, None)
+        response = jsonify(ok=True)
+        response.set_cookie("neon_remote_session", session, max_age=SESSION_SECONDS,
+                            httponly=True, samesite="Strict", secure=request.is_secure,
+                            path="/")
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     @app.get("/")
     def index():
@@ -271,9 +392,13 @@ def main():
     except ValueError:
         port = 8080
     folder = input("Upload folder [uploads]: ").strip() or "uploads"
-    token = os.environ.get("NEON_ACCESS_TOKEN", "")
-    if host not in ("127.0.0.1", "localhost", "::1") and not token:
-        raise SystemExit("Refusing network exposure without NEON_ACCESS_TOKEN. Set a long token first.")
+    exposed = host not in ("127.0.0.1", "localhost", "::1")
+    token = get_network_token() if exposed else os.environ.get("NEON_ACCESS_TOKEN", "")
+    if exposed:
+        print(f"[neon] Windows client username: neon", flush=True)
+        if not os.environ.get("NEON_ACCESS_TOKEN"):
+            print(f"[neon] Persistent password (for first Windows setup): {token}", flush=True)
+            print(f"[neon] Password file: {TOKEN_PATH}", flush=True)
     app = create_app(folder, access_token=token)
     print(f"Server running on http://{host}:{port}/")
     print(f"Files stored at: {Path(folder).expanduser().resolve()}")

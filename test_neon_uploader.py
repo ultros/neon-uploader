@@ -76,6 +76,44 @@ class FileManagerTests(unittest.TestCase):
         self.assertEqual(self.post("/api/folders", {"path": "", "name": "x"}).status_code, 409)
         self.assertEqual(self.post("/api/rename", {"path": "x", "name": "../escape"}).status_code, 400)
 
+class WindowsClientLoginTests(unittest.TestCase):
+    """End-to-end browser ticket and cookie exchange (run when Flask is available)."""
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.client = uploader.create_app(self.directory.name, access_token="a-long-test-password").test_client()
+        import base64
+        cred = base64.b64encode(b"neon:a-long-test-password").decode("ascii")
+        self.auth = {"Authorization": "Basic " + cred}
+
+    def test_windows_browser_auto_login(self):
+        base = "http://pi.lan:8080"
+        self.assertEqual(self.client.get("/api/files", base_url=base).status_code, 401)
+        response = self.client.post("/api/auth/ticket", base_url=base, headers=self.auth)
+        self.assertEqual(response.status_code, 200)
+        ticket = response.json["ticket"]
+        self.assertNotEqual(ticket, "a-long-test-password")
+        landing = self.client.get("/__neon_login", base_url=base)
+        self.assertEqual(landing.status_code, 200)
+        self.assertIn("no-referrer", landing.headers["Referrer-Policy"])
+        result = self.client.post("/__neon_login", json={"ticket": ticket}, base_url=base)
+        self.assertEqual(result.status_code, 200)
+        self.assertIn("HttpOnly", result.headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", result.headers["Set-Cookie"])
+        self.assertEqual(self.client.get("/api/files", base_url=base).status_code, 200)
+        self.assertEqual(self.client.post("/__neon_login", json={"ticket": ticket}, base_url=base).status_code, 403)
+        self.assertEqual(self.client.post("/api/auth/ticket", base_url=base).status_code, 403)
+
+    def test_ticket_bound_to_issuer_ip(self):
+        base = "http://pi.lan:8080"
+        t = self.client.post("/api/auth/ticket", base_url=base, headers=self.auth).json["ticket"]
+        remote = {"REMOTE_ADDR": "192.0.2.19"}
+        failed = self.client.post("/__neon_login", json={"ticket": t}, base_url=base,
+                                  environ_overrides=remote)
+        self.assertEqual(failed.status_code, 403)
+        self.assertEqual(self.client.post("/__neon_login", json={"ticket": t}, base_url=base).status_code, 200)
+        self.assertEqual(self.client.get("/api/files", base_url=base, environ_overrides=remote).status_code, 401)
+
 
 if __name__ == "__main__":
     unittest.main()
