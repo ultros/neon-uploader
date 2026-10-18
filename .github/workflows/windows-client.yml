@@ -1,0 +1,35 @@
+name: Windows client syntax
+on:
+  push:
+    paths:
+      - "neon-client.ps1"
+      - "neon-browser.ps1"
+      - "neon-client.bat"
+      - "neon-browse.bat"
+      - ".github/workflows/windows-client.yml"
+  pull_request:
+    paths:
+      - "neon-client.ps1"
+      - "neon-browser.ps1"
+      - "neon-client.bat"
+      - "neon-browse.bat"
+      - ".github/workflows/windows-client.yml"
+
+jobs:
+  parse-powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Windows PowerShell 5.1 syntax
+        shell: powershell
+        run: |
+          foreach ($script in @('neon-client.ps1','neon-browser.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) $script), [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count -gt 0) {
+              foreach ($err in $parseErrors) { Write-Error "$($script): $($err.Message) at $($err.Extent.StartLineNumber)" }
+              throw "PowerShell syntax errors in $script"
+            }
+            Write-Host "$script syntax OK"
+          }

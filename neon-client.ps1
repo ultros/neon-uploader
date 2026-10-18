@@ -1,10 +1,12 @@
-# Neon Uploader Windows 11 x64 client. Does not install Python or a browser extension.
+# Neon Uploader Windows 11 x64 launcher. Native Pi file explorer by default, Opera GX with -Opera.
 # First use: .\neon-client.ps1 -Setup
 # Optional automatic Windows sign-in: .\neon-client.ps1 -InstallStartup
 param(
     [switch]$Setup,
     [switch]$InstallStartup,
-    [switch]$RemoveStartup
+    [switch]$RemoveStartup,
+    [switch]$Opera,
+    [switch]$Browse
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,6 +63,7 @@ if ($InstallStartup) {
     $link = $shell.CreateShortcut($startupLink)
     $link.TargetPath = $batch
     $link.WorkingDirectory = $PSScriptRoot
+    $link.Arguments = '-Opera'  # Preserve original Opera GX auto-login at Windows sign-in.
     $link.Description = 'Sign in to the Raspberry Pi Neon Uploader using Opera GX'
     $link.Save()
     Write-Host '[neon] Enabled automatic login on Windows user sign-in.'
@@ -96,6 +99,18 @@ $baseUrl = Validate-ServerUrl ((Get-Content -LiteralPath $uriFile -Raw).Trim())
 $credential = Import-Clixml -LiteralPath $credentialFile
 if ($credential -isnot [System.Management.Automation.PSCredential] -or $credential.UserName -ne 'neon') {
     throw 'Saved credentials are invalid. Run neon-client.bat -Setup to configure again.'
+}
+
+# The default Windows client is a native file explorer, not merely a login shortcut.
+# Use -Opera to open the web application with one-use automatic authentication.
+if ($Opera -and $Browse) { throw 'Choose -Browse or -Opera, not both.' }
+if (-not $Opera) {
+    $browser = Join-Path $PSScriptRoot 'neon-browser.ps1'
+    if (-not (Test-Path -LiteralPath $browser)) {
+        throw 'Missing neon-browser.ps1. Update both Windows client scripts from GitHub.'
+    }
+    & $browser
+    return
 }
 
 # Obtain a one-time browser ticket from the Pi. Never put the persistent

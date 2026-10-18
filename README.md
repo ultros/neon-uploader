@@ -9,9 +9,44 @@ Flask file uploader, browser and downloader running on **Raspberry Pi or Linux**
 - Download one file or multiple files/folders as ZIP.
 - Right-click context menu, keyboard selection and responsive interface.
 
+## Windows 11 native Pi Share Explorer (new)
+
+**You no longer have to use Opera GX to browse the Pi.** The Windows client now opens a **native Windows graphical file browser** by default. It uses the Pi server API: no SMB mapping, mounted drive, new Python installation or browser extension required.
+
+On Windows, keep **`neon-client.bat`, `neon-client.ps1` and `neon-browser.ps1` together**. Double-click `neon-client.bat` (or `neon-browse.bat`). The first time, enter the Pi address and login as `neon` using the password printed on the Pi. The password is saved encrypted for your Windows account using DPAPI. Later launches open the native file browser without another login prompt.
+
+- Left: expandable Pi share folder tree, starting at **Share**.
+- Top: **Back / Up / Share / Refresh**, editable share-relative folder path and **Go**.
+- Right: folders and files with **Name / Type / Size / Modified** columns, sort by clicking headings, search/filter, multiselection and **Select All** checkboxes.
+- **Download** saves a selected file to a Windows path of your choosing. **Download ZIP** saves multiple selected files or whole Pi folders as one archive.
+- Double-click a folder to enter it; double-click a file to download. Right-click items for **Open/Download, Download ZIP, Rename, Delete**.
+- **New Folder, Rename, Delete** perform those operations on the Pi only after server authentication. Delete requires a confirmation and is permanent.
+- The bottom bar shows the actual **Pi share root** and server version so you can immediately spot a wrong or empty directory. An older Pi service lacking share metadata causes a visible error rather than a misleading empty file list.
+- **Open in Opera GX** opens the original web file manager via the Windows auto-login flow. You can also run `neon-client.bat -Opera` to open Opera directly, instead of the native window.
+
+### Launch commands on Windows
+
+```bat
+neon-client.bat            REM native Windows browser (default)
+neon-browse.bat            REM same native browser, desktop-friendly shortcut
+neon-client.bat -Opera     REM automatic Opera GX login to Pi web browser
+neon-client.bat -Setup     REM change saved Pi URL / username and password
+neon-client.bat -InstallStartup   REM keep Opera auto-login at Windows sign-in
+```
+
+**Important:** The native browser only exposes the Pi's **configured share root and its descendants**. It is not a file manager for the Windows computer and cannot inspect the Pi's `/etc`, `/home`, or other unrelated directories unless you intentionally choose those as the share root on the Pi. The Pi user running Neon must have filesystem access. On the Pi, update and restart the service with the intended directory:
+
+```bash
+cd neon-uploader
+git pull origin main
+python3 run.py --host 0.0.0.0 --port 8080 --share-root /actual/existing/share
+```
+
+The folder must already exist, and a USB/NFS/SMB share must be mounted before the server starts. Do not set the root to `/` without explicitly accepting the consequences of granting remote file-management access to the whole Pi. HTTP transfers are **not encrypted**; use HTTPS or a VPN outside a fully trusted local network.
+
 ## Standard download file browser (version 1.5)
 
-The **File browser** is the first section of the web application, above the upload panel. It uses a familiar Explorer-style layout with a folder sidebar, **Back / Forward / Up / Share**, a share-relative address bar, clickable folder names and breadcrumbs, sortable **Name / Size / Modified** columns, search filtering, individual **Download** buttons, checkboxes, and **Download selected** for ZIP archives. Right-click actions, uploads, rename, delete and folder creation are preserved. On narrow screens the folder sidebar stacks above the file list.
+The **File browser** is the first section of the Opera GX web application, above the upload panel. It uses a familiar Explorer-style layout with a folder sidebar, **Back / Forward / Up / Share**, a share-relative address bar, clickable folder names and breadcrumbs, sortable **Name / Size / Modified** columns, search filtering, individual **Download** buttons, checkboxes, and **Download selected** for ZIP archives. Right-click actions, uploads, rename, delete and folder creation are preserved. On narrow screens the folder sidebar stacks above the file list.
 
 - **To open a folder:** click its name or **Open** button, or type `Documents/Invoices` into the address bar and press Enter.
 - **To download one file:** click its **Download** button, or click the filename.
@@ -54,13 +89,13 @@ The server's remote username is **`neon`**. Connecting directly via `http://PI-L
 
 The browser's breadcrumb starts at **Share**. Clicking into a directory navigates further down the Pi's filesystem beneath the share; clicking **Share** returns to its root. All file operations use share-relative paths, not absolute Pi paths. The Windows launcher does not need changes to use this capability.
 
-## Windows 11 x64: automatic Opera GX login
+## Windows 11 x64: setup and optional Opera GX login
 
-Copy **`neon-client.bat` and `neon-client.ps1`** to the same folder on your Windows computer. Do **not** run the Pi Python server on Windows. To open the app:
+Copy **`neon-client.bat`, `neon-client.ps1`, and `neon-browser.ps1`** to the same folder on your Windows computer. `neon-browse.bat` is an optional convenience shortcut. Do **not** run the Pi Python server on Windows. To open the native browser:
 
 1. Double-click **`neon-client.bat`**. On first use, enter the Pi URL, for example `http://192.168.1.50:8080`, and then username `neon` and the password from the Pi terminal.
 2. If using plain HTTP, confirm the one-time trusted-LAN security warning. The client saves the address under `%APPDATA%\NeonUploader\pi-url.txt` and a **DPAPI-encrypted Windows-user credential** under `%APPDATA%\NeonUploader\credential.xml`.
-3. The launcher asks the Pi for a short-lived, one-use browser sign-in ticket, opens **Opera GX**, and signs the browser in automatically. On subsequent launches, no prompt is needed unless your Pi password has changed or your Windows credential store is unavailable.
+3. The launcher opens the **native Pi Share Explorer** directly and authenticates API requests using your Windows-encrypted saved credentials. Use **Open in Opera GX** inside the window or `neon-client.bat -Opera` for the browser auto-login flow. Subsequent launches do not prompt again unless the saved Pi credentials change.
 
 To change the saved URL/password:
 
