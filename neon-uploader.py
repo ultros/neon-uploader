@@ -25,6 +25,7 @@ MAX_ARCHIVE_FILES = 10000
 TICKET_SECONDS = 90
 SESSION_SECONDS = 12 * 60 * 60
 TOKEN_PATH = Path.home() / ".config" / "neon-uploader" / "access-token"
+SHARE_ROOT_PATH = Path.home() / ".config" / "neon-uploader" / "share-root"
 
 
 def get_network_token():
@@ -52,6 +53,49 @@ def get_network_token():
     if len(value) < 24:
         raise RuntimeError("Access token is too short; supply a longer NEON_ACCESS_TOKEN")
     return value
+
+
+
+def choose_share_root():
+    """Resolve the shared folder once and remember it on the Raspberry Pi.
+
+    NEON_SHARE_ROOT bypasses the prompt for unattended services. Never create an
+    arbitrary configured directory: a typo or an unmounted share must fail loud.
+    """
+    configured = os.environ.get("NEON_SHARE_ROOT", "").strip()
+    remembered = ""
+    if not configured and SHARE_ROOT_PATH.exists():
+        if SHARE_ROOT_PATH.is_symlink() or not SHARE_ROOT_PATH.is_file():
+            raise RuntimeError("Invalid saved share-root configuration")
+        remembered = SHARE_ROOT_PATH.read_text(encoding="utf-8").strip()
+
+    default_uploads = (Path.cwd() / "uploads").resolve()
+    suggestion = configured or remembered or str(default_uploads)
+    if configured:
+        choice = configured
+        print(f"[neon] Share root from NEON_SHARE_ROOT: {choice}", flush=True)
+    else:
+        print("[neon] Enter the Raspberry Pi directory exported as your share.", flush=True)
+        print("[neon] All subfolders beneath it will be browsable. Use an absolute Linux path.", flush=True)
+        choice = input(f"Share filesystem root [{suggestion}]: ").strip() or suggestion
+
+    provided = Path(choice).expanduser()
+    if not provided.is_absolute():
+        raise RuntimeError("Share root must be an absolute path (for example /srv/share)")
+    # Preserve the original empty uploads folder only on the first default launch.
+    if not provided.exists() and not configured and not remembered and choice == str(default_uploads):
+        provided.mkdir(parents=True, exist_ok=True)
+    if not provided.is_dir():
+        raise RuntimeError(f"Share root directory does not exist or is not a directory: {provided}")
+    root = provided.resolve(strict=True)
+    if not os.access(root, os.R_OK | os.X_OK):
+        raise RuntimeError(f"The current Pi user cannot browse the share root: {root}")
+    if not configured:
+        SHARE_ROOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if SHARE_ROOT_PATH.is_symlink():
+            raise RuntimeError("Refusing to write share-root configuration through a symlink")
+        SHARE_ROOT_PATH.write_text(str(root) + "\n", encoding="utf-8")
+    return root
 
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -105,11 +149,15 @@ def valid_new_name(name):
     return name
 
 
-def create_app(upload_folder="uploads", access_token=None):
+def create_app(upload_folder="uploads", access_token=None, create_root=True):
     """Factory makes routes testable without prompting for console input."""
     app = Flask(__name__)
-    root = Path(upload_folder).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    requested_root = Path(upload_folder).expanduser()
+    if create_root:
+        requested_root.mkdir(parents=True, exist_ok=True)
+    if not requested_root.is_dir():
+        raise RuntimeError(f"Share root missing or inaccessible: {requested_root}")
+    root = requested_root.resolve(strict=True)
     token = access_token if access_token is not None else os.environ.get("NEON_ACCESS_TOKEN", "")
     lock = threading.Lock()
     tickets = {}   # random ticket -> (expiry, originating IP)
@@ -259,7 +307,8 @@ def create_app(upload_folder="uploads", access_token=None):
                     stat.st_mtime, datetime.timezone.utc).isoformat(),
             })
         items.sort(key=lambda item: (item["type"] != "directory", item["name"].casefold()))
-        return jsonify(path=relative_name(folder) if folder != root else "", items=items)
+        return jsonify(path=relative_name(folder) if folder != root else "", items=items,
+                       root_name="Share")
 
     @app.post("/upload")
     def upload_files():
@@ -391,7 +440,10 @@ def main():
             raise ValueError
     except ValueError:
         port = 8080
-    folder = input("Upload folder [uploads]: ").strip() or "uploads"
+    try:
+        folder = choose_share_root()
+    except (OSError, RuntimeError) as error:
+        raise SystemExit(f"[neon] Share configuration error: {error}") from error
     exposed = host not in ("127.0.0.1", "localhost", "::1")
     token = get_network_token() if exposed else os.environ.get("NEON_ACCESS_TOKEN", "")
     if exposed:
@@ -399,9 +451,9 @@ def main():
         if not os.environ.get("NEON_ACCESS_TOKEN"):
             print(f"[neon] Persistent password (for first Windows setup): {token}", flush=True)
             print(f"[neon] Password file: {TOKEN_PATH}", flush=True)
-    app = create_app(folder, access_token=token)
+    app = create_app(folder, access_token=token, create_root=False)
     print(f"Server running on http://{host}:{port}/")
-    print(f"Files stored at: {Path(folder).expanduser().resolve()}")
+    print(f"Browsing share and saving uploads beneath: {folder}")
     print("For remote access, use HTTPS via a trusted reverse proxy.")
     app.run(host=host, port=port, debug=False)
 
@@ -434,7 +486,7 @@ HTML_FORM = """<!doctype html>
   <main class="wrap">
     <header class="header">
       <div class="brand"><div class="logo" aria-hidden="true">N</div><div><h1>Neon Uploader</h1><p class="subtitle">Upload · Browse · Organize · Download</p></div></div>
-      <span class="top-pill">● Local file workspace</span>
+      <span class="top-pill">● Shared filesystem</span>
     </header>
     <section class="card" aria-label="Upload files">
       <h2 class="section-title">Upload to <span id="uploadTarget">/</span></h2>
@@ -460,7 +512,7 @@ HTML_FORM = """<!doctype html>
         <div id="rows" aria-live="polite"><div class="empty">Loading files…</div></div>
       </div>
       <div class="browser-footer"><span id="fileCount">0 items</span><span id="selectionCount">0 selected</span></div>
-      <p class="hint">Right-click an item for actions. Select multiple items with checkmarks; folders download as ZIP archives. Selection applies to the current folder.</p>
+      <p class="hint">Browse every folder beneath the Pi's configured share root, including hidden files. Click Share to return to the root; right-click an item for actions. Selected folders download as ZIP archives. Paths outside the share are inaccessible.</p>
     </section>
   </main>
   <div id="contextMenu" class="context" role="menu" hidden></div>
@@ -488,7 +540,7 @@ HTML_FORM = """<!doctype html>
     function visibleItems(){const filter=$('search').value.trim().toLocaleLowerCase();return state.items.filter(i=>i.name.toLocaleLowerCase().includes(filter));}
     function renderCrumbs(){
       const nav=$('breadcrumbs');nav.replaceChildren();const segments=state.path?state.path.split('/'):[];
-      [['Home',''],...segments.map((s,i)=>[s,segments.slice(0,i+1).join('/')])].forEach(([name,path],i)=>{
+      [['Share',''],...segments.map((s,i)=>[s,segments.slice(0,i+1).join('/')])].forEach(([name,path],i)=>{
         if(i){const slash=document.createElement('span');slash.textContent='/';nav.append(slash);}
         const button=document.createElement('button');button.type='button';button.textContent=name;
         button.addEventListener('click',()=>run(()=>navigate(path)));nav.append(button);

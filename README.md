@@ -5,7 +5,7 @@ Flask file uploader, browser and downloader running on **Raspberry Pi or Linux**
 ## File management
 
 - Drag-and-drop multi-file upload; duplicate names get `_001` etc.
-- Browse directories, search, select all, rename, create folders and permanently delete with confirmation.
+- Browse the **entire configured shared folder tree** (including nested directories and hidden files), search the current folder, select all, rename, create folders and permanently delete with confirmation.
 - Download one file or multiple files/folders as ZIP.
 - Right-click context menu, keyboard selection and responsive interface.
 
@@ -17,11 +17,21 @@ cd neon-uploader
 python3 run.py
 ```
 
-Choose **`0.0.0.0`** for Host to allow other devices on your LAN, default port `8080` and an upload folder. Port `8080` must be permitted through the Pi's firewall. Find the Pi's LAN IP with `hostname -I`. The service runs until you close its terminal. For unattended Pi service, configure a systemd unit separately.
+Choose **`0.0.0.0`** for Host to allow other devices on your LAN, default port `8080`, and **enter the absolute path to your Raspberry Pi shared directory** (for example `/srv/share` or `/mnt/storage/share`) when prompted for **Share filesystem root**. The browser begins at that location and navigates every subdirectory beneath it, including dotfiles. It can upload/download, create folders, rename and delete anywhere inside the share where the Pi server account has permission. Paths above or outside this root are rejected; directory symlinks are not followed.
+
+The Pi remembers your chosen root at `~/.config/neon-uploader/share-root` and offers it again on future starts. To change it, enter a different absolute directory at the prompt. For **unattended/server startup** set `NEON_SHARE_ROOT` instead of answering the prompt:
+
+```bash
+NEON_SHARE_ROOT=/srv/share python3 run.py
+```
+
+The directory must already exist for explicit share paths. The launcher deliberately refuses to silently create a missing share directory (which could be a typo or an unavailable mount). If the share is mounted over NFS, SMB/CIFS, or USB storage, mount it **before** starting Neon Uploader. `uploads` remains the first-run fallback if you do not select a share root. Port `8080` must be permitted through the Pi's firewall. Find the Pi's LAN IP with `hostname -I`. The service runs until you close its terminal. For unattended Pi service, configure a systemd unit separately.
 
 On the first network-enabled run, the Pi generates a secure random **persistent password** and saves it in `~/.config/neon-uploader/access-token` (mode `0600` on Linux). Its value is also printed to the Pi terminal so you can enter it once on Windows. On subsequent restarts, the same password is reused. Keep this file private and back it up if you need to preserve Windows credentials across Pi replacement. **Never put the password in the public GitHub repository.** You may instead supply your own `NEON_ACCESS_TOKEN` environment variable before starting the Pi app.
 
 The server's remote username is **`neon`**. Connecting directly via `http://PI-LAN-IP:8080/` with Opera GX's ordinary HTTP authentication prompt remains supported.
+
+The browser's breadcrumb starts at **Share**. Clicking into a directory navigates further down the Pi's filesystem beneath the share; clicking **Share** returns to its root. All file operations use share-relative paths, not absolute Pi paths. The Windows launcher does not need changes to use this capability.
 
 ## Windows 11 x64: automatic Opera GX login
 
@@ -75,7 +85,7 @@ python3 -m unittest discover -p 'test_*.py'
 
 | Method | URL | Meaning |
 | --- | --- | --- |
-| GET | `/api/files?path=...` | List directory |
+| GET | `/api/files?path=...` | List any directory within configured share root |
 | POST | `/upload` | Multi-file upload |
 | GET | `/api/download?path=...` | Download file |
 | POST | `/api/download-zip` | Download selections as ZIP |

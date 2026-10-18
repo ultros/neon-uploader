@@ -76,6 +76,66 @@ class FileManagerTests(unittest.TestCase):
         self.assertEqual(self.post("/api/folders", {"path": "", "name": "x"}).status_code, 409)
         self.assertEqual(self.post("/api/rename", {"path": "x", "name": "../escape"}).status_code, 400)
 
+class SharedFilesystemTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.share = self.home / "share"
+        self.share.mkdir()
+        (self.share / "projects" / "alpha").mkdir(parents=True)
+        (self.share / "projects" / "alpha" / "report.txt").write_text("ok")
+        (self.share / ".hidden").write_text("hidden")
+        (self.home / "private.txt").write_text("private")
+        self.app = uploader.create_app(self.share, access_token="test-secret", create_root=False)
+        self.client = self.app.test_client()
+        self.auth = {"Authorization": "Basic bmVvbjp0ZXN0LXNlY3JldA=="}
+
+    def test_nested_and_hidden_files_visible_under_share(self):
+        data = self.client.get("/api/files", headers=self.auth).json
+        self.assertEqual(data["root_name"], "Share")
+        self.assertEqual({x["name"] for x in data["items"]}, {"projects", ".hidden"})
+        child = self.client.get("/api/files?path=projects/alpha", headers=self.auth).json
+        self.assertEqual([i["name"] for i in child["items"]], ["report.txt"])
+        download = self.client.get("/api/download?path=projects/alpha/report.txt", headers=self.auth)
+        self.assertEqual(download.data, b"ok")
+
+    def test_above_share_is_blocked(self):
+        for path in ("../private.txt", "/tmp", "projects/../../private.txt"):
+            resp = self.client.get("/api/download", query_string={"path": path}, headers=self.auth)
+            self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.client.get("/api/files?path=projects", headers=self.auth).status_code, 200)
+
+    def test_explicit_root_must_exist(self):
+        absent = self.home / "typo-missing-share"
+        with self.assertRaisesRegex(RuntimeError, "Share root missing"):
+            uploader.create_app(absent, access_token="x", create_root=False)
+        self.assertFalse(absent.exists())
+
+    def test_share_root_choice_saved_and_env_override(self):
+        from unittest import mock
+        config = self.home / "config" / "share-root"
+        with mock.patch.object(uploader, "SHARE_ROOT_PATH", config):
+            with mock.patch.dict(os.environ, {"NEON_SHARE_ROOT": str(self.share)}):
+                self.assertEqual(uploader.choose_share_root(), self.share)
+                self.assertFalse(config.exists())
+            with mock.patch.dict(os.environ, {"NEON_SHARE_ROOT": ""}):
+                with mock.patch("builtins.input", return_value=str(self.share)):
+                    self.assertEqual(uploader.choose_share_root(), self.share)
+                self.assertEqual(config.read_text().strip(), str(self.share))
+                with mock.patch("builtins.input", return_value=""):
+                    self.assertEqual(uploader.choose_share_root(), self.share)
+
+    def test_unconfigured_directory_refuses_creation(self):
+        from unittest import mock
+        missing = self.home / "missing-share"
+        with mock.patch.object(uploader, "SHARE_ROOT_PATH", self.home / "config" / "share-root"):
+            with mock.patch.dict(os.environ, {"NEON_SHARE_ROOT": str(missing)}):
+                with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                    uploader.choose_share_root()
+        self.assertFalse(missing.exists())
+
+
 class WindowsClientLoginTests(unittest.TestCase):
     """End-to-end browser ticket and cookie exchange (run when Flask is available)."""
     def setUp(self):
