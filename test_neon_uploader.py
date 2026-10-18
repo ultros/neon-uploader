@@ -136,6 +136,69 @@ class SharedFilesystemTests(unittest.TestCase):
         self.assertFalse(missing.exists())
 
 
+class RootSelectionTests(unittest.TestCase):
+    """The server must open a persistent real share, never make an empty replacement."""
+
+    def setUp(self):
+        from unittest import mock
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.home = Path(self.work.name)
+        self.share = self.home / "existing-share"
+        self.share.mkdir()
+        (self.share / "keep-me.txt").write_text("persistent")
+        self.config = self.home / "config" / "share-root"
+        patcher = mock.patch.object(uploader, "SHARE_ROOT_PATH", self.config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_explicit_share_root_remains_persistent(self):
+        from unittest import mock
+        with mock.patch.object(uploader, "discover_samba_shares", return_value=[]), \
+             mock.patch.dict(os.environ, {"NEON_SHARE_ROOT": ""}):
+            result = uploader.choose_share_root(explicit=str(self.share))
+            self.assertEqual(result, self.share)
+            self.assertEqual(self.config.read_text().strip(), str(self.share))
+            with mock.patch('sys.stdin.isatty', return_value=False):
+                result2 = uploader.choose_share_root()
+            self.assertEqual(result2, self.share)
+            self.assertEqual((self.share / "keep-me.txt").read_text(), "persistent")
+
+    def test_missing_share_fails_and_does_not_create_folder(self):
+        from unittest import mock
+        nonexistent = self.home / "missing-drive"
+        with mock.patch.object(uploader, "discover_samba_shares", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "missing or unavailable"):
+                uploader.choose_share_root(explicit=str(nonexistent))
+        self.assertFalse(nonexistent.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_no_known_share_does_not_fall_back_to_empty_uploads(self):
+        from unittest import mock
+        with mock.patch.object(uploader, "discover_samba_shares", return_value=[]), \
+             mock.patch.dict(os.environ, {"NEON_SHARE_ROOT": ""}), \
+             mock.patch('sys.stdin.isatty', return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Share root is not configured"):
+                uploader.choose_share_root()
+        self.assertFalse(self.config.exists())
+
+    def test_mount_guard_refuses_unmounted_path(self):
+        from unittest import mock
+        with mock.patch.object(uploader, "discover_samba_shares", return_value=[]), \
+             mock.patch.dict(os.environ, {"NEON_REQUIRE_MOUNT": "1"}), \
+             mock.patch.object(uploader.os.path, "ismount", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "mount is not active"):
+                uploader.choose_share_root(explicit=str(self.share))
+
+    def test_discover_samba_ignores_pseudo_shares(self):
+        from unittest import mock
+        conf = self.home / 'smb.conf'
+        conf.write_text(f"[global]\npath = /\n[backup]\npath = {self.share}\n"
+                        "[homes]\npath = /home/%U\n[remote]\npath = /missing/path\n")
+        with mock.patch.object(uploader.shutil, 'which', return_value=None):
+            self.assertEqual(uploader.discover_samba_shares(conf), [self.share])
+
+
 class WindowsClientLoginTests(unittest.TestCase):
     """End-to-end browser ticket and cookie exchange (run when Flask is available)."""
     def setUp(self):

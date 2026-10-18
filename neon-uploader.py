@@ -1,7 +1,11 @@
 """Neon Uploader: a small, self-hosted upload and file browsing application."""
 
+import argparse
 import datetime
 import os
+import re
+import subprocess
+import sys
 import secrets
 import threading
 import time
@@ -26,6 +30,7 @@ TICKET_SECONDS = 90
 SESSION_SECONDS = 12 * 60 * 60
 TOKEN_PATH = Path.home() / ".config" / "neon-uploader" / "access-token"
 SHARE_ROOT_PATH = Path.home() / ".config" / "neon-uploader" / "share-root"
+APP_VERSION = "1.5.0"
 
 
 def get_network_token():
@@ -56,46 +61,124 @@ def get_network_token():
 
 
 
-def choose_share_root():
-    """Resolve the shared folder once and remember it on the Raspberry Pi.
+def discover_samba_shares(config_path=Path("/etc/samba/smb.conf")):
+    """Discover locally exported Samba directories without accessing any files outside them.
 
-    NEON_SHARE_ROOT bypasses the prompt for unattended services. Never create an
-    arbitrary configured directory: a typo or an unmounted share must fail loud.
+    Prefer testparm's expanded view when installed; fall back to the usual
+    Samba config path. Dynamic paths (% substitutions) are not auto-selected.
     """
-    configured = os.environ.get("NEON_SHARE_ROOT", "").strip()
+    config_text = ""
+    testparm = shutil.which("testparm")
+    if testparm:
+        try:
+            result = subprocess.run([testparm, "-s"], capture_output=True, text=True,
+                                    timeout=5, check=False)
+            if result.returncode == 0:
+                config_text = result.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if not config_text:
+        try:
+            config_text = Path(config_path).read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError, OSError):
+            return []
+
+    shares = []
+    current = None
+    for line in config_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and "]" in line:
+            current = line[1:line.index("]")].strip().lower()
+            continue
+        if current in (None, "global", "homes", "printers", "print$", "ipc$"):
+            continue
+        match = re.match(r"^path\s*=\s*(.+)$", line, re.IGNORECASE)
+        if not match:
+            continue
+        path_string = match.group(1).strip().strip('"')
+        if "%" in path_string or "$" in path_string:
+            continue
+        directory = Path(path_string).expanduser()
+        if directory.is_absolute() and directory.is_dir() and os.access(directory, os.R_OK | os.X_OK):
+            full = directory.resolve(strict=True)
+            if full not in shares:
+                shares.append(full)
+    return shares
+
+
+def choose_share_root(explicit=None):
+    """Select the *existing* share, not a temporary/auto-created uploads folder.
+
+    Priority: CLI > env > saved config > unique Samba share > explicit prompt.
+    A legacy saved auto-created uploads root requires manual confirmation.
+    """
+    env_root = os.environ.get("NEON_SHARE_ROOT", "").strip()
+    configured = (explicit or "").strip() or env_root
+    if SHARE_ROOT_PATH.is_symlink():
+        raise RuntimeError("Refusing share-root config symlink")
     remembered = ""
-    if not configured and SHARE_ROOT_PATH.exists():
-        if SHARE_ROOT_PATH.is_symlink() or not SHARE_ROOT_PATH.is_file():
+    if SHARE_ROOT_PATH.exists():
+        if not SHARE_ROOT_PATH.is_file():
             raise RuntimeError("Invalid saved share-root configuration")
         remembered = SHARE_ROOT_PATH.read_text(encoding="utf-8").strip()
 
-    default_uploads = (Path.cwd() / "uploads").resolve()
-    suggestion = configured or remembered or str(default_uploads)
+    samba_shares = discover_samba_shares()
+    legacy_paths = {(Path.cwd() / "uploads").resolve(),
+                    (Path(__file__).resolve().parent / "uploads").resolve()}
+    legacy = bool(remembered and Path(remembered).expanduser().resolve() in legacy_paths)
+
     if configured:
         choice = configured
-        print(f"[neon] Share root from NEON_SHARE_ROOT: {choice}", flush=True)
+        print(f"[neon] Using explicitly configured share root: {choice}", flush=True)
+    elif remembered and not legacy:
+        choice = remembered
+        print(f"[neon] Reusing saved share root: {choice}", flush=True)
+    elif len(samba_shares) == 1:
+        choice = str(samba_shares[0])
+        print(f"[neon] Auto-detected Samba share: {choice}", flush=True)
     else:
-        print("[neon] Enter the Raspberry Pi directory exported as your share.", flush=True)
-        print("[neon] All subfolders beneath it will be browsable. Use an absolute Linux path.", flush=True)
-        choice = input(f"Share filesystem root [{suggestion}]: ").strip() or suggestion
+        if legacy:
+            print(f"[neon] Found legacy uploads directory ({remembered}); it is NOT automatically your share.", flush=True)
+            print("[neon] Existing files there are untouched. Choose your real share path.", flush=True)
+        if samba_shares:
+            print("[neon] Available Samba share locations:", flush=True)
+            for index, location in enumerate(samba_shares, 1):
+                print(f"  {index}. {location}", flush=True)
+        else:
+            print("[neon] No unambiguous Samba share found; enter its existing Linux path.", flush=True)
+        if not sys.stdin.isatty():
+            raise RuntimeError("Share root is not configured. Start interactively or set NEON_SHARE_ROOT=/your/share")
+        choice = input("Share filesystem root (absolute path or share number): ").strip()
+        if choice.isdigit() and samba_shares and 1 <= int(choice) <= len(samba_shares):
+            choice = str(samba_shares[int(choice) - 1])
+        if not choice:
+            raise RuntimeError("No share root chosen. No empty directory was created.")
 
     provided = Path(choice).expanduser()
     if not provided.is_absolute():
         raise RuntimeError("Share root must be an absolute path (for example /srv/share)")
-    # Preserve the original empty uploads folder only on the first default launch.
-    if not provided.exists() and not configured and not remembered and choice == str(default_uploads):
-        provided.mkdir(parents=True, exist_ok=True)
     if not provided.is_dir():
-        raise RuntimeError(f"Share root directory does not exist or is not a directory: {provided}")
-    root = provided.resolve(strict=True)
-    if not os.access(root, os.R_OK | os.X_OK):
-        raise RuntimeError(f"The current Pi user cannot browse the share root: {root}")
-    if not configured:
-        SHARE_ROOT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if SHARE_ROOT_PATH.is_symlink():
-            raise RuntimeError("Refusing to write share-root configuration through a symlink")
-        SHARE_ROOT_PATH.write_text(str(root) + "\n", encoding="utf-8")
-    return root
+        raise RuntimeError(f"Share root missing or unavailable: {provided}. Check share mounts before startup.")
+    actual = provided.resolve(strict=True)
+    if not os.access(actual, os.R_OK | os.X_OK):
+        raise RuntimeError(f"Pi user cannot browse share: {actual}")
+    # Optional guard for removable/NFS/SMB mounts whose empty underlying
+    # mountpoint could otherwise be mistaken for an empty share after reboot.
+    if os.environ.get("NEON_REQUIRE_MOUNT", "").lower() in ("1", "yes", "true"):
+        if not os.path.ismount(provided):
+            raise RuntimeError(f"Required share mount is not active: {provided}")
+    SHARE_ROOT_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if SHARE_ROOT_PATH.is_symlink():
+        raise RuntimeError("Refusing to write share-root config through a symlink")
+    SHARE_ROOT_PATH.write_text(str(actual) + "\n", encoding="utf-8")
+    try:
+        SHARE_ROOT_PATH.chmod(0o600)
+    except OSError:
+        pass
+    print(f"[neon] CONFIRMED SHARE ROOT: {actual}", flush=True)
+    return actual
 
 
 LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -149,7 +232,7 @@ def valid_new_name(name):
     return name
 
 
-def create_app(upload_folder="uploads", access_token=None, create_root=True):
+def create_app(upload_folder="uploads", access_token=None, create_root=False):
     """Factory makes routes testable without prompting for console input."""
     app = Flask(__name__)
     requested_root = Path(upload_folder).expanduser()
@@ -308,7 +391,7 @@ def create_app(upload_folder="uploads", access_token=None, create_root=True):
             })
         items.sort(key=lambda item: (item["type"] != "directory", item["name"].casefold()))
         return jsonify(path=relative_name(folder) if folder != root else "", items=items,
-                       root_name="Share")
+                       root_name="Share", share_root=str(root), version=APP_VERSION)
 
     @app.post("/upload")
     def upload_files():
@@ -432,16 +515,23 @@ def create_app(upload_folder="uploads", access_token=None, create_root=True):
 
 
 def main():
-    host = input("Host [127.0.0.1]: ").strip() or "127.0.0.1"
-    port_input = input("Port [8080]: ").strip()
+    parser = argparse.ArgumentParser(description="Neon Uploader Raspberry Pi file-share server")
+    parser.add_argument("--share-root", help="Existing absolute directory to browse; saved for future starts")
+    parser.add_argument("--host", help="Bind address (use 0.0.0.0 for LAN access)")
+    parser.add_argument("--port", type=int, help="HTTP listen port (default 8080)")
+    args = parser.parse_args()
+    host = args.host or os.environ.get("NEON_HOST") or (
+        input("Host [127.0.0.1]: ").strip() or "127.0.0.1" if sys.stdin.isatty() else "127.0.0.1")
+    port_input = args.port or os.environ.get("NEON_PORT") or (
+        input("Port [8080]: ").strip() or "8080" if sys.stdin.isatty() else "8080")
     try:
-        port = int(port_input) if port_input else 8080
+        port = int(port_input)
         if port < 1 or port > 65535:
             raise ValueError
     except ValueError:
-        port = 8080
+        parser.error("Port must be between 1 and 65535")
     try:
-        folder = choose_share_root()
+        folder = choose_share_root(explicit=args.share_root)
     except (OSError, RuntimeError) as error:
         raise SystemExit(f"[neon] Share configuration error: {error}") from error
     exposed = host not in ("127.0.0.1", "localhost", "::1")
@@ -479,7 +569,29 @@ HTML_FORM = """<!doctype html>
     .table-shell{border:1px solid var(--edge);border-radius:12px;overflow:hidden;min-height:170px}.file-head,.file-row{display:grid;grid-template-columns:36px minmax(170px,1fr) 105px 180px;align-items:center;gap:10px;padding:11px 15px}.file-head{font-size:.77rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);background:#112137}.file-row{border-top:1px solid #29415770;min-height:51px}.file-row:hover{background:#66e0ff0e}.file-row.selected{background:#66e0ff19}.file-row button.name-button{display:flex;align-items:center;text-align:left;gap:11px;border:0;background:transparent;color:var(--text);padding:0;min-width:0}.file-row button.name-button:hover{text-decoration:underline;text-decoration-color:var(--blue)}.file-icon{font-size:20px;flex-shrink:0}.file-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-row .meta{font-size:.84rem;color:var(--muted);white-space:nowrap}.file-row input[type=checkbox],.file-head input[type=checkbox]{accent-color:var(--blue);width:17px;height:17px;cursor:pointer}.empty{color:var(--muted);padding:47px 15px;text-align:center}.browser-footer{display:flex;justify-content:space-between;gap:8px;margin-top:12px;color:var(--muted);font-size:.84rem}
     .context{position:fixed;z-index:100;background:#18283a;border:1px solid #517189;border-radius:11px;padding:6px;min-width:188px;box-shadow:0 15px 45px #000a}.context[hidden]{display:none}.context button{display:block;width:100%;padding:9px 12px;text-align:left;border:0;border-radius:6px;color:var(--text);background:transparent}.context button:hover,.context button:focus-visible{background:#305069}.context button.danger{color:#ffadc9}.context hr{border:0;border-top:1px solid var(--edge)}
     .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);max-width:min(550px,95%);border:1px solid #507d88;border-radius:11px;padding:11px 17px;background:#172c3c;box-shadow:0 10px 30px #000a;z-index:200}.toast[hidden]{display:none}.hint{font-size:.83rem;color:var(--muted);margin:14px 0 0}
-    @media(max-width:700px){body{padding:16px 10px 40px}.card{padding:14px}.file-head,.file-row{grid-template-columns:25px minmax(100px,1fr) 80px;padding:10px 9px;gap:7px}.file-head span:last-child,.file-row .date{display:none}.toolbar .grow{display:none}.search{flex:1;width:100%}.browser-top{align-items:flex-start}.top-pill{display:none}}
+    /* Explorer-style navigation: no build tools or external assets required. */
+    .explorer-nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:11px 0 14px}
+    .explorer-nav .btn{padding:8px 11px}
+    .address{display:flex;align-items:center;flex:1;min-width:220px;gap:8px;border:1px solid var(--edge);border-radius:10px;background:#091521;padding:4px 7px}
+    .address span{color:var(--blue);font-size:.85rem;white-space:nowrap}
+    .address input{flex:1;min-width:40px;width:100%;border:0;outline:none;background:transparent;color:var(--text);padding:7px 4px}
+    .address input:focus-visible{outline:1px solid var(--blue);border-radius:5px}
+    .explorer-layout{display:grid;grid-template-columns:215px minmax(0,1fr);gap:13px}
+    .folder-sidebar{min-width:0;max-height:540px;overflow:auto;background:#0b1827;border:1px solid var(--edge);border-radius:12px;padding:12px}
+    .folder-sidebar h3{margin:0 0 8px;font-size:.78rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+    .folder-sidebar button{display:flex;gap:8px;align-items:center;width:100%;min-width:0;text-align:left;border:0;border-radius:7px;padding:8px;color:var(--text);background:transparent}
+    .folder-sidebar button:hover,.folder-sidebar button[aria-current="page"]{background:#22384c;color:var(--blue)}
+    .folder-sidebar .folder-label{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    .folder-sidebar .branch{padding-left:14px;border-left:1px solid var(--edge);margin-left:10px}
+    .file-head,.file-row{grid-template-columns:30px minmax(130px,1fr) 92px 163px 102px;gap:8px;padding:10px 12px}
+    .file-head .sort-header{cursor:pointer;appearance:none;background:transparent;border:0;color:var(--muted);font:inherit;font-weight:inherit;text-transform:inherit;letter-spacing:inherit;text-align:left;padding:2px 0}
+    .file-head .sort-header:hover,.file-head .sort-header[aria-sort]{color:var(--blue)}
+    .file-row .download-row{font-size:.82rem;padding:6px 8px;min-width:0}
+    .file-row .folder-action{color:var(--muted);font-size:.8rem}
+    .empty{min-height:160px}
+    @media(max-width:900px){.explorer-layout{grid-template-columns:160px minmax(0,1fr)}.file-head,.file-row{grid-template-columns:28px minmax(120px,1fr) 80px 95px;gap:6px;padding:10px 9px}.file-head .modified-col,.file-row .date{display:none}}
+    @media(max-width:620px){.explorer-layout{display:block}.folder-sidebar{max-height:155px;margin-bottom:12px}.file-head,.file-row{grid-template-columns:24px minmax(120px,1fr) 80px;gap:6px;padding:10px 8px}.file-head .size-col,.file-row .size-col{display:none}.browser-top{align-items:flex-start}}
+    @media(max-width:700px){body{padding:16px 10px 40px}.card{padding:14px}.toolbar .grow{display:none}.search{flex:1;width:100%}.browser-top{align-items:flex-start}.top-pill{display:none}}
   </style>
 </head>
 <body>
@@ -488,6 +600,40 @@ HTML_FORM = """<!doctype html>
       <div class="brand"><div class="logo" aria-hidden="true">N</div><div><h1>Neon Uploader</h1><p class="subtitle">Upload · Browse · Organize · Download</p></div></div>
       <span class="top-pill">● Shared filesystem</span>
     </header>
+    <section class="card" aria-label="File browser">
+      <div class="browser-top">
+        <div><h2 class="section-title" style="margin:0">File browser</h2><div class="tag" id="shareRootInfo" aria-live="polite">Checking Pi share root…</div><nav id="breadcrumbs" class="crumbs" aria-label="Folder path"></nav></div>
+        <div class="toolbar"><button class="btn ghost" id="refreshBtn" type="button">↻ Refresh</button><button class="btn" id="newFolderBtn" type="button">+ New folder</button></div>
+      </div>
+      <div class="explorer-nav" aria-label="File navigation">
+        <button class="btn ghost" id="backBtn" type="button" title="Back (Alt+Left)" disabled>← Back</button>
+        <button class="btn ghost" id="forwardBtn" type="button" title="Forward (Alt+Right)" disabled>→</button>
+        <button class="btn ghost" id="upBtn" type="button" title="Parent folder" disabled>↑ Up</button>
+        <button class="btn ghost" id="homeBtn" type="button" title="Share root">⌂ Share</button>
+        <form class="address" id="pathForm" aria-label="Navigate to folder within share">
+          <span>Share /</span><input id="pathBar" type="text" autocomplete="off" spellcheck="false" placeholder="folder/subfolder" aria-label="Share-relative folder path">
+          <button class="btn ghost" type="submit" title="Go to folder">Go</button>
+        </form>
+      </div>
+      <div class="toolbar">
+        <input id="search" class="search" type="search" placeholder="Filter this folder…" aria-label="Filter files and folders">
+        <span class="grow"></span><button class="btn" type="button" id="downloadSelected" disabled>↓ Download selected</button>
+        <button class="btn danger" type="button" id="deleteSelected" disabled>Delete selected</button>
+      </div>
+      <div class="explorer-layout">
+        <aside class="folder-sidebar" aria-label="Folder navigation"><h3>Folders</h3><div id="folderTree"></div></aside>
+        <div class="table-shell" id="fileBrowser" tabindex="0" aria-label="Files and folders">
+          <div class="file-head"><input id="selectAll" type="checkbox" aria-label="Select all visible files and folders">
+            <button class="sort-header" type="button" data-sort="name" aria-sort="ascending">Name ▲</button>
+            <button class="sort-header size-col" type="button" data-sort="size">Size</button>
+            <button class="sort-header modified-col" type="button" data-sort="modified">Modified</button>
+            <span>Action</span></div>
+          <div id="rows" aria-live="polite"><div class="empty">Loading files…</div></div>
+        </div>
+      </div>
+      <div class="browser-footer"><span id="fileCount">0 items</span><span id="selectionCount">0 selected</span></div>
+      <p class="hint">Explorer-style browsing inside the Pi share: click folders to open them, click Download beside a file, or select multiple items and Download ZIP. Right-click for more actions. Nothing outside the share is accessible.</p>
+    </section>
     <section class="card" aria-label="Upload files">
       <h2 class="section-title">Upload to <span id="uploadTarget">/</span></h2>
       <div class="upload-row">
@@ -497,23 +643,6 @@ HTML_FORM = """<!doctype html>
       <ul id="queueList" class="queued" aria-label="Upload queue"></ul>
       <div id="queueCount" class="queue-footer">No files queued</div>
     </section>
-    <section class="card" aria-label="File browser">
-      <div class="browser-top">
-        <div><h2 class="section-title" style="margin:0">File browser</h2><nav id="breadcrumbs" class="crumbs" aria-label="Folder path"></nav></div>
-        <div class="toolbar"><button class="btn ghost" id="refreshBtn" type="button">↻ Refresh</button><button class="btn" id="newFolderBtn" type="button">+ New folder</button></div>
-      </div>
-      <div class="toolbar">
-        <input id="search" class="search" type="search" placeholder="Search this folder…" aria-label="Search files">
-        <span class="grow"></span><button class="btn" type="button" id="downloadSelected" disabled>↓ Download selected</button>
-        <button class="btn danger" type="button" id="deleteSelected" disabled>Delete selected</button>
-      </div>
-      <div class="table-shell" id="fileBrowser" tabindex="0" aria-label="Files and folders">
-        <div class="file-head"><input id="selectAll" type="checkbox" aria-label="Select all visible files and folders"><span>Name</span><span>Size</span><span>Modified</span></div>
-        <div id="rows" aria-live="polite"><div class="empty">Loading files…</div></div>
-      </div>
-      <div class="browser-footer"><span id="fileCount">0 items</span><span id="selectionCount">0 selected</span></div>
-      <p class="hint">Browse every folder beneath the Pi's configured share root, including hidden files. Click Share to return to the root; right-click an item for actions. Selected folders download as ZIP archives. Paths outside the share are inaccessible.</p>
-    </section>
   </main>
   <div id="contextMenu" class="context" role="menu" hidden></div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
@@ -521,7 +650,7 @@ HTML_FORM = """<!doctype html>
   (() => {
     'use strict';
     const $ = id => document.getElementById(id);
-    const state = {path:'',items:[],selected:new Set(),queue:[],busy:false};
+    const state = {path:'',items:[],selected:new Set(),queue:[],busy:false,sortBy:'name',sortAsc:true,history:[],historyIndex:-1};
     const rows = $('rows'), menu = $('contextMenu'), selectAll = $('selectAll');
     let toastTimer;
     const bytes = n => n == null ? '—' : n === 0 ? '0 B' :
@@ -537,7 +666,50 @@ HTML_FORM = """<!doctype html>
     }
     const jsonOptions = obj => ({method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
     async function run(fn){ try { await fn(); } catch(error){toast(error.message || String(error));} }
-    function visibleItems(){const filter=$('search').value.trim().toLocaleLowerCase();return state.items.filter(i=>i.name.toLocaleLowerCase().includes(filter));}
+    function visibleItems(){
+      const filter=$('search').value.trim().toLocaleLowerCase();
+      return state.items.filter(i=>i.name.toLocaleLowerCase().includes(filter)).sort((a,b)=>{
+        // Folders always remain above files, as in a conventional file manager.
+        if(a.type!==b.type)return a.type==='directory'?-1:1;
+        let result=0;
+        if(state.sortBy==='name') result=a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'});
+        if(state.sortBy==='size') result=(a.size||0)-(b.size||0);
+        if(state.sortBy==='modified') result=Date.parse(a.modified)-Date.parse(b.modified);
+        return (result || a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}))*(state.sortAsc?1:-1);
+      });
+    }
+    function updateSortLabels(){
+      document.querySelectorAll('[data-sort]').forEach(button=>{
+        const active=button.dataset.sort===state.sortBy;
+        button.textContent=button.dataset.sort.charAt(0).toUpperCase()+button.dataset.sort.slice(1)+(active?(state.sortAsc?' ▲':' ▼'):'');
+        if(active)button.setAttribute('aria-sort',state.sortAsc?'ascending':'descending');else button.removeAttribute('aria-sort');
+      });
+    }
+    function updateNavigation(){
+      $('backBtn').disabled=state.historyIndex<=0;
+      $('forwardBtn').disabled=state.historyIndex<0||state.historyIndex>=state.history.length-1;
+      $('upBtn').disabled=!state.path;
+      $('pathBar').value=state.path;
+    }
+    function sidebarButton(holder,label,path,active=false){
+      const button=document.createElement('button');button.type='button';button.title=path?'/'+path:'Share root';
+      if(active)button.setAttribute('aria-current','page');
+      const icon=document.createElement('span');icon.textContent='📁';icon.setAttribute('aria-hidden','true');
+      const name=document.createElement('span');name.className='folder-label';name.textContent=label;
+      button.append(icon,name);button.addEventListener('click',()=>run(()=>navigate(path)));
+      holder.append(button);
+    }
+    function renderSidebar(){
+      const target=$('folderTree');target.replaceChildren();sidebarButton(target,'Share','',!state.path);
+      const ancestors=state.path?state.path.split('/'):[];let joined='';
+      ancestors.forEach((part,i)=>{joined=pathJoin(joined,part);const branch=document.createElement('div');branch.className='branch';
+        sidebarButton(branch,part,joined,i===ancestors.length-1);target.append(branch);
+      });
+      const folders=state.items.filter(item=>item.type==='directory');
+      const children=document.createElement('div');children.className='branch';
+      folders.forEach(item=>sidebarButton(children,item.name,item.path));target.append(children);
+    }
+
     function renderCrumbs(){
       const nav=$('breadcrumbs');nav.replaceChildren();const segments=state.path?state.path.split('/'):[];
       [['Share',''],...segments.map((s,i)=>[s,segments.slice(0,i+1).join('/')])].forEach(([name,path],i)=>{
@@ -583,17 +755,35 @@ HTML_FORM = """<!doctype html>
         open.append(icon,name);open.addEventListener('click',()=>run(()=>openItem(item)));
         const size=document.createElement('span');size.className='meta';size.textContent=bytes(item.size);
         const date=document.createElement('span');date.className='meta date';date.textContent=new Date(item.modified).toLocaleString();
-        row.append(box,open,size,date);
+        const action=document.createElement('button');action.type='button';action.className='btn download-row';
+        action.textContent=item.type==='directory'?'Open':'↓ Download';
+        action.setAttribute('aria-label',item.type==='directory'?'Open '+item.name:'Download '+item.name);
+        action.addEventListener('click',()=>run(()=>openItem(item)));
+        size.classList.add('size-col');
+        row.append(box,open,size,date,action);
         row.addEventListener('contextmenu',event=>{event.preventDefault();if(!state.selected.has(item.path)){state.selected.clear();state.selected.add(item.path);updateSelection();}showMenu(item,event.clientX,event.clientY);});
         rows.append(row);
       });
-      $('fileCount').textContent=items.length+' shown · '+state.items.length+' total';updateSelection();
+      $('fileCount').textContent=items.length+' shown · '+state.items.length+' total';renderSidebar();updateSelection();
     }
-    async function navigate(path){
+    async function navigate(path,historyMode='push'){
       menu.hidden=true;
       const response=await api('/api/files?path='+encodeURIComponent(path));const data=await response.json();
-      state.path=data.path;state.items=data.items;state.selected.clear();$('search').value='';renderCrumbs();renderRows();
+      if(!Array.isArray(data.items))throw Error('Invalid file listing from Pi');
+      state.path=data.path;state.items=data.items;state.selected.clear();$('search').value='';
+      // Browser history is per tab, not persistent or shared between devices.
+      if(historyMode==='push'&&(state.history[state.historyIndex]!==data.path)){
+        state.history=state.history.slice(0,state.historyIndex+1);
+        state.history.push(data.path);state.historyIndex=state.history.length-1;
+      }
+      $('shareRootInfo').textContent=data.share_root ? 'Pi share: '+data.share_root+' · version '+(data.version||'?') : 'Pi server needs updating (share path not reported)';
+      updateNavigation();renderCrumbs();renderRows();
     }
+    async function navigateHistory(nextIndex){
+      if(nextIndex<0||nextIndex>=state.history.length)return;
+      await navigate(state.history[nextIndex],'history');state.historyIndex=nextIndex;updateNavigation();
+    }
+    function parentPath(path){return path.includes('/')?path.slice(0,path.lastIndexOf('/')):'';}
     async function refresh(){const response=await api('/api/files?path='+encodeURIComponent(state.path));const data=await response.json();state.items=data.items;
       const stillHere=new Set(data.items.map(i=>i.path));state.selected=new Set([...state.selected].filter(p=>stillHere.has(p)));renderRows();}
     async function openItem(item){if(item.type==='directory')await navigate(item.path);else downloadFile(item.path);}
@@ -642,6 +832,21 @@ HTML_FORM = """<!doctype html>
     }
     document.addEventListener('click',event=>{if(!menu.contains(event.target))menu.hidden=true;});
     document.addEventListener('keydown',event=>{if(event.key==='Escape')menu.hidden=true;});
+    document.querySelectorAll('[data-sort]').forEach(button=>button.addEventListener('click',()=>{
+      if(state.sortBy===button.dataset.sort)state.sortAsc=!state.sortAsc;
+      else{state.sortBy=button.dataset.sort;state.sortAsc=true;}
+      updateSortLabels();renderRows();
+    }));
+    $('backBtn').addEventListener('click',()=>run(()=>navigateHistory(state.historyIndex-1)));
+    $('forwardBtn').addEventListener('click',()=>run(()=>navigateHistory(state.historyIndex+1)));
+    $('upBtn').addEventListener('click',()=>run(()=>navigate(parentPath(state.path))));
+    $('homeBtn').addEventListener('click',()=>run(()=>navigate('')));
+    $('pathForm').addEventListener('submit',event=>{event.preventDefault();run(()=>navigate($('pathBar').value.trim().replace(/^[/]+/,'')));});
+    document.addEventListener('keydown',event=>{
+      if(event.altKey&&event.key==='ArrowLeft'){event.preventDefault();run(()=>navigateHistory(state.historyIndex-1));}
+      else if(event.altKey&&event.key==='ArrowRight'){event.preventDefault();run(()=>navigateHistory(state.historyIndex+1));}
+    });
+    updateSortLabels();
     $('search').addEventListener('input',renderRows);
     selectAll.addEventListener('change',()=>{const targets=visibleItems();targets.forEach(item=>selectAll.checked?state.selected.add(item.path):state.selected.delete(item.path));updateSelection();});
     $('fileBrowser').addEventListener('keydown',event=>{

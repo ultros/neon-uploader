@@ -9,6 +9,27 @@ Flask file uploader, browser and downloader running on **Raspberry Pi or Linux**
 - Download one file or multiple files/folders as ZIP.
 - Right-click context menu, keyboard selection and responsive interface.
 
+## Standard download file browser (version 1.5)
+
+The **File browser** is the first section of the web application, above the upload panel. It uses a familiar Explorer-style layout with a folder sidebar, **Back / Forward / Up / Share**, a share-relative address bar, clickable folder names and breadcrumbs, sortable **Name / Size / Modified** columns, search filtering, individual **Download** buttons, checkboxes, and **Download selected** for ZIP archives. Right-click actions, uploads, rename, delete and folder creation are preserved. On narrow screens the folder sidebar stacks above the file list.
+
+- **To open a folder:** click its name or **Open** button, or type `Documents/Invoices` into the address bar and press Enter.
+- **To download one file:** click its **Download** button, or click the filename.
+- **To download many files or an entire folder:** select the checkboxes and click **Download selected**. A ZIP is generated on the Pi for you to save on Windows.
+- **To sort:** click Name, Size or Modified. Click again to reverse direction. Folders stay first.
+- **To go back:** use Back or Alt+Left; **Up** takes you to the parent within the share. **Share** returns to its root.
+- **To verify the correct Pi share:** the browser reports `Pi share: /actual/server/path · version 1.5.0`. A screen still showing only `Home` or `Local file workspace` means you are connected to an old running server process.
+
+**Start from the real, existing share, not a new uploads directory:**
+
+```bash
+cd neon-uploader
+git pull origin main
+python3 run.py --host 0.0.0.0 --port 8080 --share-root /path/to/your/existing/share
+```
+
+The selected root is saved in `~/.config/neon-uploader/share-root`; future runs reuse it. The startup script refuses to manufacture a missing directory, and will not silently change shares. To find the real Samba share path, check `testparm -s` or `/etc/samba/smb.conf` on the Pi. If it is a USB/SMB/NFS *mountpoint*, set `NEON_REQUIRE_MOUNT=1` to fail startup when the mount is offline, instead of showing an empty underlying directory. **The program never wipes the share at startup; it will only delete files when you explicitly use Delete.**
+
 ## Raspberry Pi: server setup
 
 ```bash
